@@ -1,0 +1,9 @@
+*.vscode
+*.log
+/build*/
+/site/
+bazel-*
+# Bzlmod lockfile
+/MODULE.bazel.lock
+compile_commands.json
+external
