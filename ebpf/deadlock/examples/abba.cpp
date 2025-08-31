@@ -32,6 +32,7 @@ void t2() {
 }
 
 int main() {
+  std::this_thread::sleep_for(15s); // 等待 ebpf 程序附加
   std::thread x(t1);
   std::thread y(t2);
   x.join();
