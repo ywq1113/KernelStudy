@@ -2,8 +2,11 @@
 // 构建 & 运行：见下方 Makefile/步骤
 
 #include "deadlock.skel.h" // 由 bpftool gen skeleton 生成
+#include "elf_utils.hpp"
+#include "utils.hpp"
 #include <bpf/libbpf.h>
 #include <errno.h>
+#include <memory>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +35,7 @@ static int on_rb_event(void *ctx, void *data, size_t len) {
   (void)ctx;
   if (len < sizeof(struct event_t))
     return 0;
-  const struct event_t *e = data;
+  const struct event_t *e = static_cast<const event_t *>(data);
 
   fprintf(stdout, "\n[DEADLOCK?] tgid=%u root_tid=%u comm=%s\n", e->tgid,
           e->root_pid, e->comm);
@@ -68,6 +71,13 @@ static const char *guess_pthread_path(void) {
   return NULL;
 }
 
+static int libbpf_log_cb(enum libbpf_print_level level, const char *fmt,
+                         va_list args) {
+  if (level == LIBBPF_DEBUG)
+    return 0;                         // 丢弃 Debug
+  return vfprintf(stderr, fmt, args); // 打印 Info/Warning/Error
+}
+
 // deadlock_user.c
 int main(int argc, char **argv) {
   const char *pthread_path = NULL;
@@ -89,95 +99,99 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!pthread_path)
-    pthread_path = guess_pthread_path();
+  auto libpath = find_lib_for_pid(target_pid, "libpthread");
+  if (!libpath)
+    libpath =
+        find_lib_for_pid(target_pid, "libc"); // glibc 2.34 后 pthread 并入 libc
 
-  if (!pthread_path) {
+  if (!libpath) {
     fprintf(stderr,
             "Failed to find libpthread.so.0; use -l to specify path.\n");
     return 1;
   }
 
+  pthread_path = libpath->c_str();
   libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
-  libbpf_set_print(libbpf_set_print_fn_t(NULL)); // 静默 libbpf 日志（按需）
+  libbpf_set_print(libbpf_log_cb); // 静默 libbpf 日志（按需）
+
   signal(SIGINT, on_sigint);
 
-  struct deadlock_bpf *skel = deadlock_bpf__open();
-  if (!skel) {
+  auto skel_ptr =
+      std::unique_ptr<deadlock_bpf, decltype(&deadlock_bpf__destroy)>(
+          nullptr, deadlock_bpf__destroy);
+  skel_ptr.reset(deadlock_bpf__open());
+  if (!skel_ptr) {
     perror("open skel");
     return 1;
   }
 
-  if (target_pid > 0)
-    skel->rodata->target_tgid = (unsigned)target_pid;
-
-  int err = deadlock_bpf__load(skel);
+  int err = deadlock_bpf__load(skel_ptr.get());
   if (err) {
     fprintf(stderr, "load skel failed: %d\n", err);
-    deadlock_bpf__destroy(skel);
     return 1;
   }
 
-  // 通过 func_name 绑定 uprobes/uretprobes（需要较新
-  // libbpf；老版本可手动解析符号偏移）
-  struct bpf_link *link_lock_enter = NULL, *link_lock_exit = NULL,
-                  *link_unlock_enter = NULL;
+  // 解析偏移
+  auto off_lock_opt =
+      find_func_offset_in_elf(pthread_path, "pthread_mutex_lock");
+  auto off_unlock_opt =
+      find_func_offset_in_elf(pthread_path, "pthread_mutex_unlock");
+  if (!off_lock_opt || !off_unlock_opt) {
+    fprintf(stderr, "ELF: not found pthread symbols in %s\n", pthread_path);
+    return 1;
+  }
+  size_t off_lock = *off_lock_opt;
+  size_t off_unlock = *off_unlock_opt;
 
-  struct bpf_uprobe_opts uopts = {};
-  uopts.sz = sizeof(uopts);
-  uopts.retprobe = 0;
-  uopts.pid = -1; // -1: 所有进程；若只跟踪某进程，也可传入其 tgid
-  uopts.func_name = "pthread_mutex_lock";
-  uopts.path = pthread_path;
+  pid_t target = target_pid; // 或 -1 做系统范围
+  const char *bin = pthread_path;
 
-  link_lock_enter =
-      bpf_program__attach_uprobe_opts(skel->progs.lock_enter, &uopts);
-  if (!link_lock_enter) {
-    perror("attach lock enter");
-    goto cleanup;
+  LIBBPF_OPTS(bpf_uprobe_opts, enter_opts, .retprobe = false, );
+
+  bpf_link *link_lock_enter = bpf_program__attach_uprobe_opts(
+      skel_ptr->progs.lock_enter, target, bin, off_lock, &enter_opts);
+  if (!link_lock_enter || libbpf_get_error(link_lock_enter)) {
+    std::fprintf(stderr, "attach lock_enter failed: %s\n",
+                 strerror(-libbpf_get_error(link_lock_enter)));
+    return 1;
   }
 
-  uopts.retprobe = 1; // uretprobe
-  link_lock_exit =
-      bpf_program__attach_uprobe_opts(skel->progs.lock_exit, &uopts);
-  if (!link_lock_exit) {
-    perror("attach lock exit");
-    goto cleanup;
+  LIBBPF_OPTS(bpf_uprobe_opts, exit_opts, .retprobe = true, );
+  bpf_link *link_lock_exit = bpf_program__attach_uprobe_opts(
+      skel_ptr->progs.lock_exit, target, bin, off_lock, &exit_opts);
+  if (!link_lock_exit || libbpf_get_error(link_lock_exit)) {
+    std::fprintf(stderr, "attach lock_ret failed: %s\n",
+                 strerror(-libbpf_get_error(link_lock_exit)));
+    return 1;
   }
 
-  uopts.retprobe = 0; // unlock 入口
-  uopts.func_name = "pthread_mutex_unlock";
-  link_unlock_enter =
-      bpf_program__attach_uprobe_opts(skel->progs.unlock_enter, &uopts);
-  if (!link_unlock_enter) {
-    perror("attach unlock enter");
-    goto cleanup;
+  LIBBPF_OPTS(bpf_uprobe_opts, unlock_opts, .retprobe = false, );
+  bpf_link *link_unlock_enter = bpf_program__attach_uprobe_opts(
+      skel_ptr->progs.unlock_enter, target, bin, off_unlock, &unlock_opts);
+  if (!link_unlock_enter || libbpf_get_error(link_unlock_enter)) {
+    std::fprintf(stderr, "attach unlock_enter failed: %s\n",
+                 strerror(-libbpf_get_error(link_unlock_enter)));
+    return 1;
   }
 
   // ring buffer 读取
-  struct ring_buffer *rb =
-      ring_buffer__new(bpf_map__fd(skel->maps.rb), on_rb_event, NULL, NULL);
-  if (!rb) {
-    perror("ring_buffer__new");
-    goto cleanup;
+  auto rb_ptr = std::unique_ptr<ring_buffer, decltype(&ring_buffer__free)>(
+      nullptr, ring_buffer__free);
+  rb_ptr.reset(ring_buffer__new(bpf_map__fd(skel_ptr->maps.rb), on_rb_event,
+                                NULL, NULL));
+  if (!rb_ptr) {
+    std::fprintf(stderr, "rb new fail\n");
+    return 1;
   }
 
   printf("deadlock (CO-RE + ringbuf) running. libpthread=%s %s\n", pthread_path,
          target_pid > 0 ? "[filter by tgid]" : "[all processes]");
 
   while (!stop) {
-    int r = ring_buffer__poll(rb, 200 /*ms*/);
+    int r = ring_buffer__poll(rb_ptr.get(), 200 /*ms*/);
     if (r == -EINTR)
       break;
   }
 
-  ring_buffer__free(rb);
-
-cleanup:
-  bpf_link__destroy(link_unlock_enter);
-  bpf_link__destroy(link_lock_exit);
-  bpf_link__destroy(link_lock_enter);
-
-  deadlock_bpf__destroy(skel);
   return 0;
 }
