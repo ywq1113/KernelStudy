@@ -88,6 +88,45 @@ schedule 最核心函数，在严格的并发/内存序/状态约束下，把 pe
     - 你这边随后真的睡下去，于是就可能“睡过头”（直到下次别的事件再唤醒）
   内核用 rq_lock() + smp_mb__after_spinlock() 来把关键读写顺序钉死，避免这种丢唤醒。
 
+- RQ 时钟两阶段更新机制
+  ```c
+  #define RQCF_REQ_SKIP		0x01  // 请求更新，但可能跳过
+  #define RQCF_ACT_SKIP		0x02  // 正在执行更新（active）
+  #define RQCF_UPDATED		0x04  // debug flag
+  ```
+  有些路径只是标记“需要更新”，不立刻做，真正的更新必须在安全上下文（比如这里先关闭了irq，然后持有 rq lock）
+  
+  两段式的原因：
+  
+  1）避免重复更新
+
+  2）保证上下文安全
+
+  3）rq 是热点结构，减少无谓写操作，避免 cacheline 抖动
+
+  用锁来保障而不是使用原子结构的原因：
+
+  1）原子操作比 spinlock + 批量更新贵
+
+  2）需要保障一组数据的一致性（clock, clock_task, load tracking）
+
+  update_rq_clock 的实现
+  ```c
+  void update_rq_clock(struct rq *rq)
+  {
+    s64 delta;
+	lockdep_assert_rq_held(rq);
+	if (rq->clock_update_flags & RQCF_ACT_SKIP)
+		return;
+
+	delta = sched_clock_cpu(cpu_of(rq)) - rq->clock;
+	if (delta < 0)
+		return;
+	rq->clock += delta;
+	update_rq_clock_task(rq, delta);
+  }
+  ```
+
 ```c
 static void __sched notrace __schedule(unsigned int sched_mode)
 {
